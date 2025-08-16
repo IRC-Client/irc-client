@@ -90,6 +90,9 @@ class IRCClient:
         self.log_file = None
         self.log_target = ""
         self.log_directory = ""
+        self.last_msg_count = 0
+        self.needs_full_redraw = True
+        self.last_input = ""
 
     def connect(self):
         try:
@@ -274,7 +277,7 @@ class IRCClient:
         curses.noecho()
         curses.cbreak()
         self.stdscr.keypad(True)
-        curses.curs_set(0)
+        curses.curs_set(1)
         self.stdscr.nodelay(1)
         self.stdscr.refresh()
         self.msg_win = curses.newwin(curses.LINES-1, curses.COLS, 0, 0)
@@ -290,7 +293,8 @@ class IRCClient:
             return
         
         new_msg_count = self.message_queue.qsize()
-        if new_msg_count > 0:
+        if new_msg_count > 0 or self.needs_full_redraw:
+            self.needs_full_redraw = False
             for _ in range(new_msg_count):
                 try:
                     msg = self.message_queue.get_nowait()
@@ -302,26 +306,31 @@ class IRCClient:
                     pass
             if len(self.wrapped_lines) > self.max_lines:
                 self.wrapped_lines = self.wrapped_lines[-self.max_lines:]
-        
-        self.msg_win.clear()
-        start_line = max(0, len(self.wrapped_lines) - (curses.LINES-1) - self.scroll_offset)
-        for i, line in enumerate(self.wrapped_lines[start_line:start_line + curses.LINES-1]):
-            try:
-                self.msg_win.addstr(i, 0, line)
-            except:
-                pass
-        self.msg_win.refresh()
+            
+            self.msg_win.clear()
+            start_line = max(0, len(self.wrapped_lines) - (curses.LINES-1) - self.scroll_offset)
+            for i, line in enumerate(self.wrapped_lines[start_line:start_line + curses.LINES-1]):
+                try:
+                    self.msg_win.addstr(i, 0, line)
+                except:
+                    pass
+            self.msg_win.refresh()
         
         prompt = f"[{self.active_target}]> " if self.active_target else "> "
         total_input = prompt + self.current_input
         display_input = total_input[-curses.COLS:]
+        cursor_pos = len(prompt) + self.input_pos
+        cursor_x = min(cursor_pos, curses.COLS-1)
             
-        self.input_win.clear()
-        try:
-            self.input_win.addstr(0, 0, display_input)
-        except:
-            pass
-        self.input_win.refresh()
+        if display_input != self.last_input or self.needs_full_redraw:
+            self.input_win.clear()
+            try:
+                self.input_win.addstr(0, 0, display_input)
+                self.input_win.move(0, cursor_x)
+            except:
+                pass
+            self.input_win.refresh()
+            self.last_input = display_input
 
     def log_message(self, message):
         if not self.log_enabled or not self.log_file:
@@ -359,6 +368,7 @@ class IRCClient:
                     self.msg_win.resize(curses.LINES-1, curses.COLS)
                     self.input_win.mvwin(curses.LINES-1, 0)
                     self.input_win.resize(1, curses.COLS)
+                    self.needs_full_redraw = True
                     continue
                 elif c == curses.ERR:
                     time.sleep(0.01)
