@@ -12,6 +12,8 @@ import queue
 import curses
 import textwrap
 import datetime
+import json
+import stat
 
 def generate_ed25519_certificate(key_path, cert_path):
     try:
@@ -93,6 +95,62 @@ class IRCClient:
         self.last_msg_count = 0
         self.needs_full_redraw = True
         self.last_input = ""
+        self.flood_control = {}
+        self.blocked_users = {}
+        self.config_file = "irc_client_config.json"
+        self.reconnecting = False
+        self.autojoin_channels = []
+
+    def save_config(self):
+        config = {
+            "host": self.host,
+            "port": self.port,
+            "ssl_enabled": self.ssl_enabled,
+            "sasl_method": self.sasl_method,
+            "sasl_username": self.sasl_username,
+            "sasl_password": self.sasl_password,
+            "certfile": self.certfile,
+            "keyfile": self.keyfile,
+            "nick": self.nick,
+            "user": self.user,
+            "real_name": self.real_name,
+            "show_joins_quits": self.show_joins_quits,
+            "log_enabled": self.log_enabled,
+            "log_directory": self.log_directory,
+            "channels": self.channels
+        }
+        try:
+            with open(self.config_file, "w") as f:
+                json.dump(config, f)
+            os.chmod(self.config_file, stat.S_IRUSR | stat.S_IWUSR)
+            return True
+        except:
+            return False
+
+    def load_config(self):
+        try:
+            if not os.path.exists(self.config_file):
+                return False
+            with open(self.config_file, "r") as f:
+                config = json.load(f)
+            self.host = config["host"]
+            self.port = config["port"]
+            self.ssl_enabled = config["ssl_enabled"]
+            self.sasl_method = config["sasl_method"]
+            self.sasl_username = config["sasl_username"]
+            self.sasl_password = config["sasl_password"]
+            self.certfile = config["certfile"]
+            self.keyfile = config["keyfile"]
+            self.nick = config["nick"]
+            self.user = config["user"]
+            self.real_name = config["real_name"]
+            self.show_joins_quits = config["show_joins_quits"]
+            self.log_enabled = config["log_enabled"]
+            self.log_directory = config["log_directory"]
+            self.autojoin_channels = config["channels"]
+            return True
+        except:
+            return False
 
     def connect(self):
         try:
@@ -114,8 +172,22 @@ class IRCClient:
             self.send_initial_commands()
             return True
         except Exception as e:
-            traceback.print_exc()
+            self.message_queue.put(f"*** Connection failed: {str(e)}")
             return False
+
+    def reconnect(self):
+        self.reconnecting = True
+        self.message_queue.put("*** Attempting to reconnect...")
+        time.sleep(5)
+        while self.running and not self.connected:
+            if self.connect():
+                for channel in self.autojoin_channels:
+                    self.send_command(f"JOIN {channel}")
+                self.message_queue.put("*** Reconnected successfully!")
+                self.reconnecting = False
+                return
+            time.sleep(10)
+        self.reconnecting = False
 
     def send_initial_commands(self):
         if self.sasl_method:
@@ -163,6 +235,8 @@ class IRCClient:
             except:
                 break
         self.cleanup()
+        if self.running and not self.reconnecting:
+            self.reconnect()
 
     def cleanup_socket(self):
         with self.sock_lock:
@@ -175,9 +249,9 @@ class IRCClient:
 
     def cleanup(self):
         self.cleanup_socket()
-        self.running = False
         self.connected = False
-        self.message_queue.put("*** Disconnected from server")
+        if not self.reconnecting:
+            self.message_queue.put("*** Disconnected from server")
 
     def cleanup_curses(self):
         if self.stdscr:
@@ -192,42 +266,57 @@ class IRCClient:
             token = message.split(' ', 1)[1]
             self.send_command(f"PONG {token}")
             return
+        
         parts = message.split()
         if not parts:
             return
         if len(parts) < 2:
             return
-        should_print = True
-        if not self.show_joins_quits and parts[1] in ['JOIN', 'PART', 'QUIT']:
-            should_print = False
-        if parts[1] == "PRIVMSG":
-            should_print = False
-        if should_print:
-            self.message_queue.put(f"<<< {message}")
-        if parts[1] == "CAP":
-            if len(parts) > 3 and parts[3] == "LS":
-                if "sasl" in message and self.sasl_method:
-                    self.send_command("CAP REQ :sasl")
-                else:
-                    self.send_command("CAP END")
-            elif len(parts) > 3 and parts[3] == "ACK" and "sasl" in message:
-                if self.sasl_method == "plain":
-                    self.authenticate_sasl_plain()
-                elif self.sasl_method == "external":
-                    self.authenticate_sasl_external()
-            elif len(parts) > 3 and parts[3] == "NAK":
-                self.send_command("CAP END")
-        elif parts[1] == "AUTHENTICATE":
-            if len(parts) > 2 and parts[2] == "+" and self.sasl_method == "external":
-                self.send_command("AUTHENTICATE +")
-        elif parts[1] == "PRIVMSG":
+        
+        sender = ""
+        if parts[0].startswith(':'):
             sender = parts[0][1:].split('!')[0]
+        
+        command = parts[1]
+        
+        if command == "PRIVMSG":
             target = parts[2]
             content = ' '.join(parts[3:])[1:]
+            
+            key = sender
+            now = time.time()
+            
+            if key in self.blocked_users:
+                if now - self.blocked_users[key] < 86400:
+                    return
+                del self.blocked_users[key]
+            
+            if key in self.flood_control:
+                last_time, count = self.flood_control[key]
+                if now - last_time < 10.0:
+                    if count >= 3:
+                        self.blocked_users[key] = now
+                        del self.flood_control[key]
+                        return
+                    self.flood_control[key] = (now, count + 1)
+                else:
+                    self.flood_control[key] = (now, 1)
+            else:
+                self.flood_control[key] = (now, 1)
+            
+            if content.startswith('\x01') and content.endswith('\x01'):
+                content = content[1:-1]
+                ctcp_parts = content.split(' ', 1)
+                ctcp_command = ctcp_parts[0].upper()
+                if ctcp_command == "VERSION":
+                    self.send_command(f"NOTICE {sender} :\x01VERSION IRC Client\x01")
+                return
+            
             is_private = target == self.nick
             contains_nick = self.nick.lower() in content.lower()
             if is_private or contains_nick:
                 content = content.upper()
+            
             if is_private:
                 if sender not in self.privmsgs:
                     self.privmsgs[sender] = []
@@ -242,25 +331,51 @@ class IRCClient:
                 self.message_queue.put(f"<{sender}> {content}")
                 if not self.active_target:
                     self.active_target = target
-        elif parts[1] == "JOIN":
+            return
+        
+        should_print = True
+        if not self.show_joins_quits and command in ['JOIN', 'PART', 'QUIT']:
+            should_print = False
+        if should_print:
+            self.message_queue.put(f"<<< {message}")
+        
+        if command == "CAP":
+            if len(parts) > 3 and parts[3] == "LS":
+                if "sasl" in message and self.sasl_method:
+                    self.send_command("CAP REQ :sasl")
+                else:
+                    self.send_command("CAP END")
+            elif len(parts) > 3 and parts[3] == "ACK" and "sasl" in message:
+                if self.sasl_method == "plain":
+                    self.authenticate_sasl_plain()
+                elif self.sasl_method == "external":
+                    self.authenticate_sasl_external()
+            elif len(parts) > 3 and parts[3] == "NAK":
+                self.send_command("CAP END")
+        elif command == "AUTHENTICATE":
+            if len(parts) > 2 and parts[2] == "+" and self.sasl_method == "external":
+                self.send_command("AUTHENTICATE +")
+        elif command == "JOIN":
             user = parts[0][1:].split('!')[0]
             channel = parts[2][1:] if parts[2].startswith(':') else parts[2]
             if user == self.nick:
                 if channel not in self.channels:
                     self.channels.append(channel)
+                    self.save_config()
                     if channel not in self.privmsgs:
                         self.privmsgs[channel] = []
                 self.active_target = channel
-        elif parts[1] == "PART":
+        elif command == "PART":
             user = parts[0][1:].split('!')[0]
             channel = parts[2]
             if user == self.nick:
                 if channel in self.channels:
                     self.channels.remove(channel)
+                    self.save_config()
                 if self.active_target == channel:
                     self.active_target = self.channels[-1] if self.channels else next(iter(self.privmsgs.keys()), None)
-        elif parts[1].isdigit():
-            code_str = parts[1]
+        elif command.isdigit():
+            code_str = command
             if code_str == '903':
                 self.sasl_authenticated = True
                 self.send_command("CAP END")
@@ -271,7 +386,7 @@ class IRCClient:
                 self.send_command(f"NICK {self.nick}")
             elif code_str in ['904', '905', '906', '907']:
                 self.send_command("CAP END")
-                    
+
     def setup_curses(self):
         self.stdscr = curses.initscr()
         curses.noecho()
@@ -405,13 +520,17 @@ class IRCClient:
                     if self.input_pos < len(self.current_input):
                         self.input_pos += 1
                 elif c == curses.KEY_PPAGE:
-                    self.scroll_offset = min(self.scroll_offset + curses.LINES-1, len(self.wrapped_lines) - (curses.LINES-1))
+                    self.scroll_offset = min(self.scroll_offset + curses.LINES-1, max(0, len(self.wrapped_lines) - (curses.LINES-1)))
+                    self.needs_full_redraw = True
                 elif c == curses.KEY_NPAGE:
                     self.scroll_offset = max(0, self.scroll_offset - curses.LINES-1)
+                    self.needs_full_redraw = True
                 elif c == curses.KEY_HOME:
-                    self.scroll_offset = len(self.wrapped_lines) - (curses.LINES-1)
+                    self.scroll_offset = max(0, len(self.wrapped_lines) - (curses.LINES-1))
+                    self.needs_full_redraw = True
                 elif c == curses.KEY_END:
                     self.scroll_offset = 0
+                    self.needs_full_redraw = True
                 elif c == 3:
                     self.quit()
                 elif c >= 32 and c <= 126:
@@ -433,9 +552,6 @@ class IRCClient:
                     else:
                         self.handle_privmsg(user_input)
                 except queue.Empty:
-                    if not self.receive_thread.is_alive() and not self.connected:
-                        self.running = False
-                        break
                     continue
                 except KeyboardInterrupt:
                     self.quit()
@@ -467,7 +583,11 @@ class IRCClient:
         elif cmd == "part":
             if args:
                 channel = args[0]
-                self.send_command(f"PART {channel}")
+                message = ' '.join(args[1:]) if len(args) > 1 else ""
+                if message:
+                    self.send_command(f"PART {channel} :{message}")
+                else:
+                    self.send_command(f"PART {channel}")
         elif cmd == "msg":
             if len(args) >= 2:
                 target = args[0]
@@ -481,7 +601,10 @@ class IRCClient:
                 if self.log_enabled and self.log_target != target:
                     self.setup_logging(target)
         elif cmd == "quit":
-            self.quit()
+            quit_message = "Goodbye!"
+            if args:
+                quit_message = ' '.join(args)
+            self.quit(quit_message)
         elif cmd == "list":
             for target, messages in self.privmsgs.items():
                 self.message_queue.put(f"--- {target} ---")
@@ -521,11 +644,11 @@ class IRCClient:
         if self.log_enabled:
             self.log_message(f"<{self.nick}> {message}")
 
-    def quit(self):
+    def quit(self, message="Goodbye!"):
         if self.running:
             self.running = False
             try:
-                self.send_command("QUIT :Goodbye!")
+                self.send_command(f"QUIT :{message}")
             except:
                 pass
             time.sleep(0.5)
@@ -533,45 +656,54 @@ class IRCClient:
 
 def main():
     client = IRCClient()
-    client.host = input("Server: ").strip()
-    port_input = input("Port [6667]: ").strip()
-    client.port = int(port_input) if port_input.isdigit() else 6667
-    ssl_choice = input("Use SSL? (y/n): ").lower().strip()
-    client.ssl_enabled = ssl_choice == 'y'
-    sasl_choice = input("SASL method (none/plain/external) [none]: ").lower().strip()
-    client.sasl_method = sasl_choice if sasl_choice in ['plain', 'external'] else None
-    if client.sasl_method == 'external':
-        gen_new = input("Generate new ed25519 key pair and self-signed certificate? (y/n): ").lower().strip()
-        if gen_new == 'y':
-            key_path = input("Path for private key (e.g., key.pem): ").strip()
-            cert_path = input("Path for certificate (e.g., cert.pem): ").strip()
-            generate_ed25519_certificate(key_path, cert_path)
-            fingerprint = compute_cert_fingerprint(cert_path)
-            print(f"SHA-512 fingerprint: {fingerprint}")
-            client.certfile = cert_path
-            client.keyfile = key_path
-        else:
-            client.certfile = input("Certificate file: ").strip()
-            client.keyfile = input("Private key file: ").strip()
-    elif client.sasl_method == 'plain':
-        client.sasl_username = input("SASL username: ").strip()
-        client.sasl_password = getpass("SASL password: ").strip()
-    jq_choice = input("Show joins/quits? (y/n) [y]: ").lower().strip()
-    client.show_joins_quits = jq_choice != 'n'
-    client.nick = input("Nickname: ").strip()
-    username = input("Username [same as nickname]: ").strip()
-    client.user = username or client.nick
-    real_name = input("Real name: ").strip()
-    client.real_name = real_name or client.nick
     
-    log_choice = input("Log messages to file? (y/n): ").lower().strip()
-    if log_choice == 'y':
-        client.log_enabled = True
-        log_dir = input("Log directory (leave empty for current directory): ").strip()
-        if log_dir:
-            client.log_directory = log_dir
-            if not os.path.exists(log_dir):
-                os.makedirs(log_dir)
+    if client.load_config():
+        use_saved = input("Use saved connection settings? (y/n): ").lower().strip()
+        if use_saved != 'y':
+            client = IRCClient()
+    
+    if not client.load_config():
+        client.host = input("Server: ").strip()
+        port_input = input("Port [6667]: ").strip()
+        client.port = int(port_input) if port_input.isdigit() else 6667
+        ssl_choice = input("Use SSL? (y/n): ").lower().strip()
+        client.ssl_enabled = ssl_choice == 'y'
+        sasl_choice = input("SASL method (none/plain/external) [none]: ").lower().strip()
+        client.sasl_method = sasl_choice if sasl_choice in ['plain', 'external'] else None
+        if client.sasl_method == 'external':
+            gen_new = input("Generate new ed25519 key pair and self-signed certificate? (y/n): ").lower().strip()
+            if gen_new == 'y':
+                key_path = input("Path for private key (e.g., key.pem): ").strip()
+                cert_path = input("Path for certificate (e.g., cert.pem): ").strip()
+                generate_ed25519_certificate(key_path, cert_path)
+                fingerprint = compute_cert_fingerprint(cert_path)
+                print(f"SHA-512 fingerprint: {fingerprint}")
+                client.certfile = cert_path
+                client.keyfile = key_path
+            else:
+                client.certfile = input("Certificate file: ").strip()
+                client.keyfile = input("Private key file: ").strip()
+        elif client.sasl_method == 'plain':
+            client.sasl_username = input("SASL username: ").strip()
+            client.sasl_password = getpass("SASL password: ").strip()
+        jq_choice = input("Show joins/quits? (y/n) [y]: ").lower().strip()
+        client.show_joins_quits = jq_choice != 'n'
+        client.nick = input("Nickname: ").strip()
+        username = input("Username [same as nickname]: ").strip()
+        client.user = username or client.nick
+        real_name = input("Real name: ").strip()
+        client.real_name = real_name or client.nick
+        
+        log_choice = input("Log messages to file? (y/n): ").lower().strip()
+        if log_choice == 'y':
+            client.log_enabled = True
+            log_dir = input("Log directory (leave empty for current directory): ").strip()
+            if log_dir:
+                client.log_directory = log_dir
+                if not os.path.exists(log_dir):
+                    os.makedirs(log_dir)
+    
+    client.save_config()
     
     if not client.connect():
         return
