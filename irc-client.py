@@ -314,21 +314,27 @@ class IRCClient:
             
             is_private = target == self.nick
             contains_nick = self.nick.lower() in content.lower()
-            if is_private or contains_nick:
+            
+            if is_private:
                 content = content.upper()
+                formatted_message = f"[PM] <{sender}> {content}"
+            else:
+                if contains_nick:
+                    content = content.upper()
+                formatted_message = f"[{target}] <{sender}> {content}"
             
             if is_private:
                 if sender not in self.privmsgs:
                     self.privmsgs[sender] = []
-                self.privmsgs[sender].append(f"<{sender}> {content}")
-                self.message_queue.put(f"<{sender}> {content}")
+                self.privmsgs[sender].append(formatted_message)
+                self.message_queue.put(formatted_message)
                 if not self.active_target:
                     self.active_target = sender
             else:
                 if target not in self.privmsgs:
                     self.privmsgs[target] = []
-                self.privmsgs[target].append(f"<{sender}> {content}")
-                self.message_queue.put(f"<{sender}> {content}")
+                self.privmsgs[target].append(formatted_message)
+                self.message_queue.put(formatted_message)
                 if not self.active_target:
                     self.active_target = target
             return
@@ -446,6 +452,9 @@ class IRCClient:
                 pass
             self.input_win.refresh()
             self.last_input = display_input
+        else:
+            self.input_win.move(0, cursor_x)
+            self.input_win.refresh()
 
     def log_message(self, message):
         if not self.log_enabled or not self.log_file:
@@ -595,8 +604,8 @@ class IRCClient:
                 self.send_command(f"PRIVMSG {target} :{message}")
                 if target not in self.privmsgs:
                     self.privmsgs[target] = []
-                self.privmsgs[target].append(f"<{self.nick}> {message}")
-                self.message_queue.put(f"<{self.nick}> {message}")
+                self.privmsgs[target].append(f"[{target}] <{self.nick}> {message}")
+                self.message_queue.put(f"[{target}] <{self.nick}> {message}")
                 self.active_target = target
                 if self.log_enabled and self.log_target != target:
                     self.setup_logging(target)
@@ -628,8 +637,8 @@ class IRCClient:
                 self.send_command(f"PRIVMSG {self.active_target} :\x01ACTION {message}\x01")
                 if self.active_target not in self.privmsgs:
                     self.privmsgs[self.active_target] = []
-                self.privmsgs[self.active_target].append(f"* {self.nick} {message}")
-                self.message_queue.put(f"* {self.nick} {message}")
+                self.privmsgs[self.active_target].append(f"[{self.active_target}] * {self.nick} {message}")
+                self.message_queue.put(f"[{self.active_target}] * {self.nick} {message}")
         else:
             self.send_command(command)
 
@@ -639,10 +648,10 @@ class IRCClient:
         self.send_command(f"PRIVMSG {self.active_target} :{message}")
         if self.active_target not in self.privmsgs:
             self.privmsgs[self.active_target] = []
-        self.privmsgs[self.active_target].append(f"<{self.nick}> {message}")
-        self.message_queue.put(f"<{self.nick}> {message}")
+        self.privmsgs[self.active_target].append(f"[{self.active_target}] <{self.nick}> {message}")
+        self.message_queue.put(f"[{self.active_target}] <{self.nick}> {message}")
         if self.log_enabled:
-            self.log_message(f"<{self.nick}> {message}")
+            self.log_message(f"[{self.active_target}] <{self.nick}> {message}")
 
     def quit(self, message="Goodbye!"):
         if self.running:
